@@ -1,0 +1,13 @@
+# Generated at runtime by setup_autostart.bat
+artlist_launcher.vbs
+
+# Python
+__pycache__/
+*.pyc
+
+# OS / editor cruft
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
