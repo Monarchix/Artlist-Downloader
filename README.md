@@ -21,7 +21,7 @@ A [Tampermonkey](https://www.tampermonkey.net/) userscript that adds **download 
 - **Download history** with **CSV / M3U** export
 - Optional **ID3 / Vorbis tag** embedding + cover art
 - **Pause / resume / retry** queue with per-track progress
-- A **"Saved" toast** with one-click **Open folder** (via the optional helper)
+- A **"Saved" toast** that **auto-opens the folder** in Explorer the moment a download finishes — no click, no extra step (toggle it off in Settings if you'd rather click manually)
 - A clean **in-page settings panel** (gear button, bottom-right)
 
 ---
@@ -30,7 +30,7 @@ A [Tampermonkey](https://www.tampermonkey.net/) userscript that adds **download 
 
 - **Google Chrome** or **Microsoft Edge** (the direct-to-folder saving needs the File System Access API)
 - **[Tampermonkey](https://www.tampermonkey.net/)** browser extension
-- *(Optional)* **Python 3** — only needed for the "Open folder" button to launch Windows Explorer
+- **Python 3** — for the "Open folder" button to launch a real Windows Explorer window. Skippable, but then folder-opening falls back to a browser tab and needs Tampermonkey's "Allow access to file URLs" turned on
 
 ---
 
@@ -52,23 +52,43 @@ choose a folder for **Music**, **SFX**, and **Footage**. Files then save straigh
 
 ---
 
-## 📂 Optional: "Open folder" helper
+## 📂 Auto-open the save folder
 
-After a download, a toast shows an **Open folder** button. Browsers can't open Windows Explorer
-on their own, so a tiny Python helper does it. Setup is one-time:
+After a download, the toast opens the exact save folder by itself — no button click. Two things
+have to be in place:
 
-1. **Install Python 3** from [python.org](https://www.python.org/downloads/) — tick **"Add Python to PATH"** during install.
-2. **Run `setup_autostart.bat`** (double-click) once. This:
-   - registers an `artlist://` handler so the helper **auto-starts** when you open Artlist (no console window),
-   - adds it to your Windows Startup folder.
-   The first time the script triggers it, Chrome asks *"Allow artlist.io to open Artlist DL Helper?"* — click **Open** and tick **Always allow**.
-3. In the script's **Settings → Download folders**, paste the **full path** of each folder
-   (e.g. `C:\Users\You\Music`) so "Open folder" knows where to go.
+**1. Tell the script where the folder actually is.** Click the **gear button** → **Download
+folders** → paste the **full path** for each folder you use (e.g. `C:\Users\You\Music`) into the
+small text box under that folder's picker. Browsers deliberately never reveal the OS path of a
+folder you picked through a dialog, so the script cannot work this out on its own.
 
-The helper shuts itself down ~5 seconds after your last Artlist tab closes.
+**2. Install the helper** — see below. It's what turns the path into a real Explorer window.
+
+Turn the whole thing off under **Settings → Download folders → "Auto-open folder after download"**.
+With no path set, the toast still lists the saved files inline; it just can't open a folder view.
+
+### The helper (recommended — this is what makes "Open folder" work)
+
+1. **Install Python 3** from [python.org](https://www.python.org/downloads/) — tick **"Add
+   python.exe to PATH"** during install.
+2. **Double-click `setup_autostart.bat`** once. It prints four checks and tells you if any of them
+   fail. It registers an `artlist://` handler, adds a silent startup entry so the helper runs from
+   every login, and then proves the helper is answering before it says "Setup complete".
+3. Confirm in the script: **gear → Debug → Check helper** should read **"Helper running"**.
+
+If the helper is ever down mid-session, click **Open folder** on the toast (or **gear → Debug →
+Start helper**) and Chrome will ask *"Allow artlist.io to open Artlist DL Helper?"* — click
+**Open** and tick **Always allow**. That prompt only appears from a real click; that is why there
+is a button for it rather than the script doing it silently at page load.
+
 To remove it later, run **`uninstall_helper.bat`**.
 
-> Without the helper, the **Open folder** button still works — it just lists the saved files inside the toast instead of opening Explorer.
+### Fallback without the helper
+
+With a full path set but no helper, the script opens a **browser tab** at the folder instead of an
+Explorer window. This needs one Chrome setting that is **off by default**: `chrome://extensions` →
+**Tampermonkey** → **Details** → enable **"Allow access to file URLs"**. Without it Chrome silently
+drops the tab and the toast will tell you so.
 
 ---
 

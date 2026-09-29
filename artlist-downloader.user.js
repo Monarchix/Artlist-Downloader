@@ -10,13 +10,14 @@
 // @grant       GM_registerMenuCommand
 // @grant       GM_notification
 // @grant       GM_setClipboard
+// @grant       GM_openInTab
 // @connect     cms-public-artifacts.artlist.io
 // @connect     cms-artifacts.artlist.io
 // @connect     fonts.googleapis.com
 // @connect     fonts.gstatic.com
 // @connect     127.0.0.1
 // @require     https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js
-// @version     1.0.0
+// @version     1.1.4
 // @run-at      document-start
 // @updateURL   https://github.com/Monarchix/artlist-downloader/raw/main/artlist-downloader.user.js
 // @downloadURL https://github.com/Monarchix/artlist-downloader/raw/main/artlist-downloader.user.js
@@ -79,7 +80,7 @@ var SingleSongData = 'none'
  * the page-type / data-type matching that the download mechanism depends on.
  * ========================================================================== */
 
-const ARTLIST_DL_VERSION = '1.0.0'
+const ARTLIST_DL_VERSION = '1.1.4'
 
 // ---- Settings -------------------------------------------------------------
 const SETTINGS_KEY = 'artlist-dl-settings'
@@ -101,6 +102,7 @@ const DEFAULT_SETTINGS = {
     skipDownloadedInBulk: false, // skip already-downloaded tracks in "Download all"
     autoSyncFolders: true, // scan output folders on startup to mark local files yellow
     defaultFootageResolution: '1080p', // preferred resolution for bulk footage download
+    autoOpenFolder: true, // auto-open Explorer/Finder via the helper after each save, no click needed
     // Full OS paths for "open folder" quick-launch (user pastes once, never re-enters)
     'folderPath.music': '',
     'folderPath.sfx': '',
@@ -263,6 +265,17 @@ function BuildDebugReport() {
             }
             return out
         }),
+        // "Open folder" depends on all three of these lining up; a report that
+        // omits them can't tell a dead helper from an unset path.
+        helper: safe(() => ({
+            available: HelperAvailable,
+            origin: HELPER_ORIGIN,
+            paths: {
+                music: GetSetting('folderPath.music') || null,
+                sfx: GetSetting('folderPath.sfx') || null,
+                footage: GetSetting('folderPath.footage') || null
+            }
+        })),
         recentFootageHls: safe(() => {
             const out = []
             for (const r of RequestLog) if (/footage-hls\/[^?]*_playlist_/.test(r.url)) out.push(r.url)
@@ -1176,20 +1189,159 @@ function CheckHelper() {
 }
 
 // Opens the folder in the OS file manager via the local helper.
-// Returns true on success, false if helper is not running or path not set.
+// Resolves { ok, notFound } — notFound distinguishes "path doesn't exist on
+// disk" (stale/mismatched setting) from "helper isn't reachable at all",
+// so the UI can point at the right fix instead of a generic error.
 function OpenFolderViaHelper(kind, categorySegments) {
     return new Promise(resolve => {
         const fullPath = BuildFullPath(kind, categorySegments)
-        if (!fullPath) { resolve(false); return }
-        if (typeof GM_xmlhttpRequest === 'undefined') { resolve(false); return }
+        if (!fullPath) { resolve({ ok: false, notFound: false }); return }
+        if (typeof GM_xmlhttpRequest === 'undefined') { resolve({ ok: false, notFound: false }); return }
         GM_xmlhttpRequest({
             method: 'GET',
             url: HELPER_ORIGIN + '/open?path=' + encodeURIComponent(fullPath),
-            timeout: 2000,
-            onload: r => resolve(r.status === 200),
-            onerror: () => resolve(false), ontimeout: () => resolve(false)
+            // Generous: when no window exists yet the helper spawns Explorer and
+            // waits up to 3 s to find and raise the window it made. Timing out
+            // early here would report a failure for a folder that did open, and
+            // send the user chasing the wrong fix.
+            timeout: 6000,
+            onload: r => resolve({ ok: r.status === 200, notFound: r.status === 404 }),
+            onerror: () => resolve({ ok: false, notFound: false }),
+            ontimeout: () => resolve({ ok: false, notFound: false })
         })
     })
+}
+
+// ---- Folder open without the Python helper ----------------------------------
+// Chrome blocks a *webpage* from navigating to file:// via window.open() —
+// that's the real limitation. GM_openInTab goes through Tampermonkey's own
+// privileged tab-creation API instead of page-context navigation, so it isn't
+// subject to that block and needs no local process running. One-time caveat:
+// the user must enable "Allow access to file URLs" for the Tampermonkey
+// extension in chrome://extensions, or the created tab renders blank/blocked.
+let HelperAvailable = false // set by the page-load ping in the lifecycle IIFE below
+
+function BuildFileUrl(fullPath) {
+    if (!fullPath) return null
+    const norm = fullPath.replace(/\\/g, '/')
+    const encoded = norm.split('/').map(encodeURIComponent).join('/')
+    const withDriveColon = encoded.replace(/^([A-Za-z])%3A/, '$1:') // keep "C:" readable
+    return withDriveColon.startsWith('/') ? 'file://' + withDriveColon : 'file:///' + withDriveColon
+}
+
+// GM_openInTab doesn't report whether the tab actually opened — Chrome silently
+// drops file:// tab creation from an extension that lacks "Allow access to file
+// URLs", with no exception thrown on our end. So this doesn't just trust the
+// call: it waits briefly to see whether *this* tab actually loses focus, which
+// only happens if a new active tab really took over. No signal within the
+// window means treat it as failed so the caller can fall back to something
+// that's guaranteed to work (the inline file list).
+function OpenFolderInFileTab(kind, categorySegments) {
+    if (typeof GM_openInTab === 'undefined') return Promise.resolve(false)
+    const url = BuildFileUrl(BuildFullPath(kind, categorySegments))
+    if (!url) return Promise.resolve(false)
+    return new Promise(resolve => {
+        let settled = false
+        const finish = ok => {
+            if (settled) return
+            settled = true
+            document.removeEventListener('visibilitychange', onVisible)
+            resolve(ok)
+        }
+        const onVisible = () => { if (document.hidden) finish(true) }
+        document.addEventListener('visibilitychange', onVisible)
+        try {
+            GM_openInTab(url, { active: true, insert: true, setParent: true })
+        } catch (e) {
+            RecordError('OpenFolderInFileTab', e, { url })
+            finish(false)
+            return
+        }
+        setTimeout(() => finish(false), 1200)
+    })
+}
+
+// ---- Starting the helper from the page --------------------------------------
+// Chrome only hands a page to an external protocol handler while that page has
+// *user activation*. A load-time unsafeWindow.open('artlist://start') is
+// swallowed by the popup blocker before it ever reaches the protocol layer, so
+// the "Allow artlist.io to open Artlist DL Helper?" prompt never appears and
+// the helper never comes up — which left every "Open folder" falling through to
+// the file:// tab. Firing it from inside a real click is what makes it work.
+//
+// MUST be called synchronously from a click handler: any await before it drops
+// the activation and puts us back in the silently-blocked case.
+function RequestHelperStart() {
+    try {
+        const w = unsafeWindow.open('artlist://start', '_blank')
+        if (w) { try { w.close() } catch (e) {} }
+        return true
+    } catch (e) {
+        RecordError('RequestHelperStart', e)
+        return false
+    }
+}
+
+// Poll /ping until the helper answers or we run out of patience. pythonw's
+// first start on a cold cache is comfortably slower than a single check.
+async function WaitForHelper(maxMs) {
+    const deadline = Date.now() + (maxMs || 4000)
+    while (Date.now() < deadline) {
+        if (await CheckHelper()) { HelperAvailable = true; return true }
+        await new Promise(r => setTimeout(r, 400))
+    }
+    return false
+}
+
+// The page-load ping is a hint, not a verdict — the helper is routinely started
+// *after* the first tab opens (logon task still running, user launched it by
+// hand, or the click above just brought it up). Latching that first "no" for
+// the whole session was the reason a perfectly healthy helper still never got
+// used. Re-probe on demand, rate-limited so a dead helper doesn't cost a
+// timeout on every single download.
+const HELPER_REPROBE_MS = 5000
+let _lastHelperProbe = 0
+async function EnsureHelper() {
+    if (HelperAvailable) return true
+    const now = Date.now()
+    if (now - _lastHelperProbe < HELPER_REPROBE_MS) return false
+    _lastHelperProbe = now
+    HelperAvailable = await CheckHelper()
+    return HelperAvailable
+}
+
+// Tries the Python helper (real Explorer/Finder window), then falls back to the
+// file:// tab, which needs nothing running — just the full path pasted once in
+// settings, plus Tampermonkey's "Allow access to file URLs".
+// `reason` tells the caller which advice to show when it fails.
+async function OpenSaveFolder(kind, categorySegments) {
+    if (await EnsureHelper()) {
+        const { ok, notFound } = await OpenFolderViaHelper(kind, categorySegments)
+        if (ok) return { ok: true, notFound: false, reason: null }
+        if (notFound) return { ok: false, notFound: true, reason: 'not-found' }
+        HelperAvailable = false // answered /ping but not /open — treat as gone
+    }
+    const ok = await OpenFolderInFileTab(kind, categorySegments)
+    return { ok, notFound: false, reason: ok ? null : (HelperAvailable ? 'file-blocked' : 'no-helper') }
+}
+
+// ---- Auto-open debounce ------------------------------------------------------
+// A bulk download only shows one toast for the whole batch, so that's already
+// safe. This guards the other case: several *separate* single-track downloads
+// to the same folder within a few seconds — without it, each would pop its own
+// Explorer window. Re-opening the same path is a no-op while the cooldown holds;
+// a different path (or the manual button) always goes through immediately.
+const AUTO_OPEN_COOLDOWN_MS = 4000
+let _lastAutoOpenPath = null
+let _lastAutoOpenTs = 0
+function ShouldAutoOpen(fullPath) {
+    const now = Date.now()
+    if (fullPath && fullPath === _lastAutoOpenPath && (now - _lastAutoOpenTs) < AUTO_OPEN_COOLDOWN_MS) {
+        return false
+    }
+    _lastAutoOpenPath = fullPath
+    _lastAutoOpenTs = now
+    return true
 }
 
 // ---- "Saved" toast (bottom-right above gear, fades after 5 s) ---------------
@@ -1274,84 +1426,137 @@ function ShowSavedToast(displayPath, rootHandle, categorySegments, kind) {
     }
 
     // "Open folder" button:
-    //   • If base path is set in settings → GM_openInTab opens Chrome's file browser
-    //     at the exact subfolder (real folder view, no picker dialog).
-    //   • Otherwise → list files inline using the FileSystemDirectoryHandle as fallback.
+    //   • If a full OS path is set in Settings → auto-opens the moment the toast
+    //     appears (Python helper if it's already running, otherwise a Chrome
+    //     file:// tab via GM_openInTab — no helper/process required either way).
+    //     The button just re-triggers it, or explains why it couldn't.
+    //   • Otherwise → auto-lists files inline via the already-granted
+    //     FileSystemDirectoryHandle (also automatic, no click needed).
     const canDirectOpen = kind && HasFolderPath(kind)
+    const fullPath = canDirectOpen ? BuildFullPath(kind, categorySegments) : null
+    let btn = null
+    let timerElRef = null // wired up once the timer bar element exists, below
+
+    const showHint = (text, color) => {
+        const hint = document.createElement('div')
+        hint.className = 'file-more'
+        hint.style.color = color || '#f5a623'
+        hint.textContent = text
+        bodyEl.insertBefore(hint, timerElRef)
+    }
+
+    // When the folder can't be *opened*, the next best thing is handing the user
+    // the exact path so one paste into an Explorer address bar gets them there.
+    const showCopyPathRow = () => {
+        if (!fullPath) return
+        const b = document.createElement('button')
+        b.className = 'btn'
+        b.style.marginTop = '6px'
+        b.textContent = '📋 Copy folder path'
+        b.title = fullPath
+        b.addEventListener('click', () => {
+            try {
+                if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(fullPath, 'text')
+                else navigator.clipboard.writeText(fullPath)
+                b.textContent = '✓ Path copied — paste in Explorer'
+            } catch (e) {
+                RecordError('showCopyPathRow', e)
+            }
+        })
+        bodyEl.insertBefore(b, timerElRef)
+    }
+
+    const listFilesInline = async () => {
+        if (!rootHandle) return false
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ Loading…' }
+        try {
+            let dirHandle = rootHandle
+            for (const seg of (categorySegments || [])) {
+                dirHandle = await dirHandle.getDirectoryHandle(seg)
+            }
+            const files = []
+            for await (const [name, entry] of dirHandle.entries()) {
+                if (entry.kind === 'file') files.push(name)
+            }
+            files.sort()
+            if (btn) { btn.remove(); btn = null }
+            if (!files.length) { showHint('(folder is empty)', '#666'); return true }
+            const list = document.createElement('div')
+            list.className = 'file-list'
+            const SHOW = 6
+            for (const name of files.slice(0, SHOW)) {
+                const ext = (name.match(/\.([a-z0-9]+)$/i) || [])[1] || ''
+                const icon = ['ts','mp4','mov'].includes(ext) ? '🎬'
+                    : ['mp3','aac','wav','flac','ogg','m4a'].includes(ext) ? '🔊' : '📄'
+                const row = document.createElement('div')
+                row.className = 'file-row'
+                const iconEl = document.createElement('span')
+                iconEl.className = 'file-icon'; iconEl.textContent = icon
+                const nameEl = document.createElement('span')
+                nameEl.className = 'file-name'
+                nameEl.textContent = name; nameEl.title = name
+                row.appendChild(iconEl); row.appendChild(nameEl)
+                list.appendChild(row)
+            }
+            if (files.length > SHOW) {
+                const more = document.createElement('div')
+                more.className = 'file-more'
+                more.textContent = `+ ${files.length - SHOW} more`
+                list.appendChild(more)
+            }
+            bodyEl.insertBefore(list, timerElRef)
+            return true
+        } catch (err) {
+            if (btn) { btn.disabled = false; btn.textContent = '📂 Show files' }
+            RecordError('ShowSavedToast.listFilesInline', err)
+            showHint('Could not list files — ' + (err && err.message ? err.message : String(err)))
+            return false
+        }
+    }
+
+    // Shared by the automatic trigger and the manual button click.
+    // `viaClick` means the listener below already fired artlist://start inside
+    // the gesture, so it's worth waiting for the helper to finish booting
+    // before writing it off and dropping to the file:// tab.
+    const openFolder = async (viaClick) => {
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ Opening…' }
+        if (viaClick && !HelperAvailable) await WaitForHelper(4000)
+        const { ok, notFound, reason } = await OpenSaveFolder(kind, categorySegments)
+        if (btn) {
+            btn.disabled = false
+            btn.textContent = ok ? '✓ Opened' : '📂 Open folder'
+        }
+        if (ok) return true
+        // Each failure has a different fix, and pointing at the wrong one costs
+        // the user an evening — so say which one actually applies.
+        if (notFound) {
+            showHint('Folder is not on disk: ' + fullPath + ' — fix the path under Settings → Download folders')
+        } else if (reason === 'no-helper') {
+            showHint('Helper not running. Click "Open folder" and choose Open when Chrome asks to launch Artlist DL Helper — or run setup_autostart.bat once so it starts with Windows.')
+            showCopyPathRow()
+        } else {
+            showHint('Chrome blocked opening the folder tab. Enable it once: chrome://extensions → Tampermonkey → Details → "Allow access to file URLs".')
+            showCopyPathRow()
+        }
+        if (rootHandle) await listFilesInline()
+        return false
+    }
+
     if (canDirectOpen || rootHandle) {
-        const btn = document.createElement('button')
+        btn = document.createElement('button')
         btn.className = 'btn'
         btn.textContent = canDirectOpen ? '📂 Open folder' : '📂 Show files'
         btn.title = canDirectOpen
-            ? 'Opens Chrome file browser at the saved folder'
-            : 'Lists the saved files right here (set a base path in settings for real folder open)'
-        btn.addEventListener('click', async () => {
-            // Primary: open via Python helper (opens real Explorer/Finder)
-            if (kind && HasFolderPath(kind)) {
-                btn.disabled = true
-                btn.textContent = '⏳ Opening…'
-                const opened = await OpenFolderViaHelper(kind, categorySegments)
-                if (opened) { btn.textContent = '✓ Opened'; return }
-                // Helper not running — show a helpful hint
-                btn.textContent = '📂 Show files'
-                btn.disabled = false
-                const hint = document.createElement('div')
-                hint.className = 'file-more'
-                hint.style.color = '#f5a623'
-                hint.textContent = 'Helper not running — start "Start Artlist Helper.bat" first'
-                bodyEl.insertBefore(hint, timerEl)
-            }
-            // Fallback: list files inline via FileSystemDirectoryHandle
-            if (!rootHandle) return
-            btn.disabled = true
-            btn.textContent = '⏳ Loading…'
-            try {
-                let dirHandle = rootHandle
-                for (const seg of (categorySegments || [])) {
-                    try { dirHandle = await dirHandle.getDirectoryHandle(seg) } catch (e) { break }
-                }
-                const files = []
-                for await (const [name, entry] of dirHandle.entries()) {
-                    if (entry.kind === 'file') files.push(name)
-                }
-                files.sort()
-                btn.remove()
-                if (!files.length) {
-                    const empty = document.createElement('div')
-                    empty.className = 'file-more'
-                    empty.textContent = '(folder is empty)'
-                    bodyEl.insertBefore(empty, timerEl)
-                    return
-                }
-                const list = document.createElement('div')
-                list.className = 'file-list'
-                const SHOW = 6
-                for (const name of files.slice(0, SHOW)) {
-                    const ext = (name.match(/\.([a-z0-9]+)$/i) || [])[1] || ''
-                    const icon = ['ts','mp4','mov'].includes(ext) ? '🎬'
-                        : ['mp3','aac','wav','flac','ogg','m4a'].includes(ext) ? '🔊' : '📄'
-                    const row = document.createElement('div')
-                    row.className = 'file-row'
-                    const iconEl = document.createElement('span')
-                    iconEl.className = 'file-icon'; iconEl.textContent = icon
-                    const nameEl = document.createElement('span')
-                    nameEl.className = 'file-name'
-                    nameEl.textContent = name; nameEl.title = name
-                    row.appendChild(iconEl); row.appendChild(nameEl)
-                    list.appendChild(row)
-                }
-                if (files.length > SHOW) {
-                    const more = document.createElement('div')
-                    more.className = 'file-more'
-                    more.textContent = `+ ${files.length - SHOW} more`
-                    list.appendChild(more)
-                }
-                bodyEl.insertBefore(list, timerEl)
-            } catch (err) {
-                btn.disabled = false
-                btn.textContent = '📂 Show files'
-                RecordError('ShowSavedToast', err)
-            }
+            ? 'Opens the saved folder — via the helper if running, otherwise a browser tab'
+            : 'Lists the saved files right here (paste a full path in Settings for real folder open)'
+        btn.addEventListener('click', () => {
+            if (!canDirectOpen) { listFilesInline(); return }
+            // Synchronous, before any await — this is the only moment the page
+            // still has the user activation Chrome requires to launch
+            // artlist://. Skipped when the helper already answered a ping, so
+            // the permission prompt only shows up when it's actually needed.
+            if (!HelperAvailable) RequestHelperStart()
+            openFolder(true)
         })
         bodyEl.appendChild(btn)
     }
@@ -1362,6 +1567,7 @@ function ShowSavedToast(displayPath, rootHandle, categorySegments, kind) {
     barEl.className = 'bar'
     timerEl.appendChild(barEl)
     bodyEl.appendChild(timerEl)
+    timerElRef = timerEl
 
     const xBtn = document.createElement('button')
     xBtn.className = 'x'
@@ -1371,6 +1577,21 @@ function ShowSavedToast(displayPath, rootHandle, categorySegments, kind) {
     toast.appendChild(bodyEl)
     toast.appendChild(xBtn)
     shadow.appendChild(toast)
+
+    // Auto-open: fires the moment the toast lands, no click needed. The
+    // debounce only applies to the real-folder path (helper/file tab) — it
+    // guards against several *separate* single-track downloads to the same
+    // folder each popping their own window; it doesn't apply to the inline
+    // list, which is scoped to its own toast and never spawns anything.
+    if (GetSetting('autoOpenFolder')) {
+        if (canDirectOpen) {
+            // No user activation here, so no artlist:// launch — this path
+            // relies on the helper already running (the logon task's job).
+            if (ShouldAutoOpen(fullPath)) openFolder(false)
+        } else if (rootHandle) {
+            listFilesInline()
+        }
+    }
 
     requestAnimationFrame(() => {
         toast.classList.add('in')
@@ -2652,6 +2873,21 @@ function adlBuildBody(body) {
     folders.body.appendChild(adlFolderRow('music'))
     folders.body.appendChild(adlFolderRow('sfx'))
     folders.body.appendChild(adlFolderRow('footage'))
+    folders.body.appendChild(
+        adlToggle('Auto-open folder after download', 'autoOpenFolder')
+    )
+    folders.body.appendChild(
+        adlEl('p', {
+            class: 'adl-hint',
+            text:
+                'Paste a full path (e.g. C:\\Users\\You\\Music) in a folder box above and that folder ' +
+                'opens by itself after each download. Run setup_autostart.bat once from the script ' +
+                'folder and the Python helper starts with Windows, so you get a real Explorer/Finder ' +
+                'window. Without it there is a fallback that opens a browser tab at the path instead, ' +
+                'which needs chrome://extensions → Tampermonkey → Details → "Allow access to file ' +
+                'URLs" turned on. Debug → Check helper tells you which one is in play.'
+        })
+    )
     body.appendChild(folders.card)
 
     const dl = adlSection('Downloads')
@@ -2859,29 +3095,52 @@ function adlBuildBody(body) {
         style: { color: '#888' },
         text: 'Helper: checking…'
     })
+    const setHelperStatus = (text, color) => {
+        helperStatus.textContent = text
+        helperStatus.style.color = color
+    }
     const helperCheck = adlEl('button', {
         class: 'adl-btn',
         text: 'Check helper',
         style: { marginTop: '4px' },
         onClick: async () => {
-            helperStatus.textContent = 'Checking…'
-            helperStatus.style.color = '#888'
+            setHelperStatus('Checking…', '#888')
             const ok = await CheckHelper()
-            helperStatus.textContent = ok
-                ? '✓ Helper is running — "Open folder" will open Explorer directly'
-                : '✗ Helper not running — start "Start Artlist Helper.bat" in the script folder'
-            helperStatus.style.color = ok ? '#82ff59' : '#f5a623'
+            HelperAvailable = ok
+            setHelperStatus(
+                ok ? '✓ Helper is running — "Open folder" opens Explorer directly'
+                   : '✗ Helper not running — hit "Start helper"',
+                ok ? '#82ff59' : '#f5a623'
+            )
+        }
+    })
+    // Launching artlist:// needs user activation, which only exists inside a
+    // real click — so RequestHelperStart() runs first, before any await.
+    const helperStart = adlEl('button', {
+        class: 'adl-btn',
+        text: 'Start helper',
+        style: { marginTop: '4px' },
+        onClick: async () => {
+            RequestHelperStart()
+            setHelperStatus('Starting…', '#888')
+            const ok = await WaitForHelper(6000)
+            setHelperStatus(
+                ok ? '✓ Helper running'
+                   : '✗ Could not start it. Run setup_autostart.bat once in the script folder, then reload this page.',
+                ok ? '#82ff59' : '#f5a623'
+            )
         }
     })
     // Auto-check on drawer open
     CheckHelper().then(ok => {
-        helperStatus.textContent = ok
-            ? '✓ Helper running'
-            : '✗ Helper not running — start "Start Artlist Helper.bat"'
-        helperStatus.style.color = ok ? '#82ff59' : '#f5a623'
+        HelperAvailable = ok
+        setHelperStatus(
+            ok ? '✓ Helper running' : '✗ Helper not running — hit "Start helper"',
+            ok ? '#82ff59' : '#f5a623'
+        )
     })
     dbg.body.appendChild(helperStatus)
-    dbg.body.appendChild(helperCheck)
+    dbg.body.appendChild(adlEl('div', { class: 'adl-row adl-row-btns' }, [helperCheck, helperStart]))
     dbg.body.appendChild(adlToggle('Verbose debug logging', 'debug'))
     dbg.body.appendChild(
         adlEl('div', { class: 'adl-row adl-row-btns' }, [
@@ -3247,20 +3506,18 @@ LoadOutputFolders().then(() => {
 LogDebug('Artlist DL v' + ARTLIST_DL_VERSION + ' loaded')
 
 // ---- Helper auto-lifecycle --------------------------------------------------
-// On page load: ping the helper. If not running, fire artlist://start (triggers
-// the VBS launcher registered by setup_autostart.bat) then re-ping.
-// On tab close: send /disconnect so the helper can shut down when count hits 0.
+// On page load: ping the helper, nothing more. This used to also fire
+// artlist://start here to self-heal a missing helper, but a page has no user
+// activation at load time, so Chrome's popup blocker ate the call before it
+// reached the protocol handler — it never once produced the "Allow artlist.io
+// to open Artlist DL Helper?" prompt, it just burned five seconds of polling.
+// Starting the helper now belongs to the logon task (setup_autostart.bat), with
+// the gesture-driven RequestHelperStart() as the recovery path.
+// On tab close: send /disconnect (informational only — the helper no longer
+// shuts itself down on this, see artlist_helper.py).
 ;(async () => {
-    let running = await CheckHelper()
-    if (!running) {
-        // Try to auto-start via the registered artlist:// protocol handler.
-        // Chrome will ask for permission the FIRST time; after the user allows
-        // it and checks "Always allow for artlist.io", it fires silently forever.
-        try { unsafeWindow.open('artlist://start', '_blank') } catch (e) {}
-        // Wait for pythonw to start up (takes ~1–2 s on first run)
-        await new Promise(r => setTimeout(r, 2000))
-        running = await CheckHelper()
-    }
+    const running = await CheckHelper()
+    HelperAvailable = running // a false here is re-probed on demand by EnsureHelper()
     if (running) {
         // Tell the helper this tab is open
         GM_xmlhttpRequest({
