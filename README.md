@@ -100,7 +100,8 @@ drops the tab and the toast will tell you so.
 | Bottom-right | **⬇ Download all** for the current page/pack |
 | Footage clip | Click **Download** → pick a resolution → saves to `Footage/<Clip Name>/` |
 | Footage pack (story) | One click grabs every clip in the pack |
-| Yellow button | You already downloaded this one |
+| Yellow button with a ✓ | You already downloaded this one. **Click** opens its folder; **Shift + Click** downloads it again |
+| **⬇ Download all** on a mixed page | Skips what you already have and fetches only the new ones. **Shift + Click** the button to include everything |
 
 `Alt + Click` a button to copy its download URL instead of saving.
 
