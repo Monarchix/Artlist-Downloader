@@ -17,7 +17,7 @@
 // @connect     fonts.gstatic.com
 // @connect     127.0.0.1
 // @require     https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js
-// @version     1.2.0
+// @version     1.3.0
 // @run-at      document-start
 // @updateURL   https://github.com/Monarchix/artlist-downloader/raw/main/artlist-downloader.user.js
 // @downloadURL https://github.com/Monarchix/artlist-downloader/raw/main/artlist-downloader.user.js
@@ -80,7 +80,7 @@ var SingleSongData = 'none'
  * the page-type / data-type matching that the download mechanism depends on.
  * ========================================================================== */
 
-const ARTLIST_DL_VERSION = '1.2.0'
+const ARTLIST_DL_VERSION = '1.3.0'
 
 // ---- Settings -------------------------------------------------------------
 const SETTINGS_KEY = 'artlist-dl-settings'
@@ -88,7 +88,6 @@ const DEFAULT_SETTINGS = {
     filenamePattern: '{type} {artist} - {title} {album}({ids})',
     notifications: true,
     markDownloaded: true,
-    confirmRedownload: true, // ask before downloading something already in the history (Shift-click skips)
     autoDetectExtension: true,
     embedTags: false, // experimental: prepend ID3v2 tags (mp3/aac/flac/wav)
     embedCoverArt: false, // fetch and embed cover art into ID3 APIC frame
@@ -100,7 +99,6 @@ const DEFAULT_SETTINGS = {
     categorize: true, // sort downloads into nested folders by genre
     categoryDepth: 3, // max nesting depth for multi-genre tracks
     downloadAllCap: 25, // confirm before bulk-downloading more than this many
-    skipDownloadedInBulk: false, // skip already-downloaded tracks in "Download all"
     autoSyncFolders: true, // scan output folders on startup to mark local files yellow
     defaultFootageResolution: '1080p', // preferred resolution for bulk footage download
     autoOpenFolder: true, // auto-open Explorer/Finder via the helper after each save, no click needed
@@ -583,10 +581,11 @@ function EnsureBadgeStyle() {
 
 function DownloadedTitle(id) {
     const hit = LogLatestOk(DownloadLog, id)
-    if (!hit) return 'Artlist DL: already downloaded (Shift-click to skip the prompt)'
+    const hint = ' | Click: open folder. Shift-click: download again.'
+    if (!hit) return 'Artlist DL: already downloaded' + hint
     const when = new Date(hit.ts).toLocaleDateString()
     const where = [hit.folder, hit.file].filter(Boolean).join('/')
-    return 'Artlist DL: downloaded ' + when + (where ? ' - ' + where : '')
+    return 'Artlist DL: downloaded ' + when + (where ? ' - ' + where : '') + hint
 }
 
 function ApplyDownloadedStyle(button) {
@@ -605,20 +604,32 @@ function ApplyDownloadedStyle(button) {
     EnsureBadgeStyle()
 }
 
-// Clicking a track you already have asks first, since that is the click that
-// wastes a download. Shift-click, or the setting, turns the prompt off.
-function ConfirmRedownload(id, label) {
-    if (!id || !IsDownloaded(id) || !GetSetting('confirmRedownload')) return true
+// Clicking the download button of something you already have opens the folder it
+// is in instead of fetching it again; Shift-click downloads it anyway. Returns
+// true when it took the click, so the caller must not start a download.
+function OpenIfDownloaded(shiftKey, id, kind, category) {
+    if (shiftKey || !id || !IsDownloaded(id)) return false
+    OpenDownloadedFolder(id, kind, category).catch(e => RecordError('OpenDownloadedFolder', e))
+    return true
+}
+
+// Where the file went: the folder the log recorded when there is one (that is
+// where it really is, even if the genre rules have changed since), otherwise the
+// folder this item would be saved to today. A zip's "folder" is the zip's own
+// name, which is not a directory.
+async function OpenDownloadedFolder(id, kind, fallbackCategory) {
     const hit = LogLatestOk(DownloadLog, id)
-    const when = hit ? ' on ' + new Date(hit.ts).toLocaleDateString() : ''
-    const yes = unsafeWindow.confirm(
-        'Artlist DL: "' + (label || id) + '" was already downloaded' + when +
-        '.\n\nDownload it again?\n(Hold Shift when clicking to skip this question.)'
-    )
-    // Chrome's "stop this page creating dialogs" makes confirm() answer no for
-    // good, which would otherwise look like a dead button.
-    if (!yes) Notify('Skipped: already downloaded (Shift-click to download again)', 'Artlist DL')
-    return yes
+    const logged = hit && hit.folder && !/\.zip$/i.test(hit.folder) ? hit.folder.split('/') : null
+    const segments = logged || fallbackCategory || []
+    if (!HelperAvailable) await WaitForHelper(4000)
+    const { ok, notFound } = await OpenSaveFolder(kind, segments)
+    if (ok) {
+        Notify('Already downloaded: opened its folder (Shift-click to download again)', 'Artlist DL')
+    } else if (notFound) {
+        Notify('Already downloaded, but its folder is not on disk. Shift-click to download it again.', 'Artlist DL')
+    } else {
+        Notify('Already downloaded. Could not open the folder: check the helper is running and the folder path is set in Settings. Shift-click to download again.', 'Artlist DL')
+    }
 }
 
 function BuildTags(d, trackNum) {
@@ -2302,11 +2313,16 @@ async function ScrollToBottom() {
 }
 
 // ---- "Download all on page" button ----------------------------------------
-function CollectPageDownloads() {
+// Things already downloaded are left out, so a page that mixes old and new
+// tracks only fetches the new ones. `includeDownloaded` (Shift-click on the
+// button) puts them back. How many were left out is kept for the notice.
+let _lastCollectSkipped = 0
+function CollectPageDownloads(includeDownloaded) {
     const items = []
     const seen = new Set()
     const pagetype = GetPagetype()
-    const skipDl = GetSetting('skipDownloadedInBulk')
+    const skipDl = !includeDownloaded
+    _lastCollectSkipped = 0
     const root = TBody || unsafeWindow.document
 
     // Footage pages: collect HLS items from loaded footage data. Each item carries
@@ -2329,7 +2345,7 @@ function CollectPageDownloads() {
                 if (isStory && storyId && String(norm.storyId) !== String(storyId)) continue
                 seen.add(norm.hlsUrl)
                 const fid = norm.clipId ? 'f.' + norm.clipId : null
-                if (skipDl && fid && IsDownloaded(fid)) continue
+                if (skipDl && fid && IsDownloaded(fid)) { _lastCollectSkipped++; continue }
                 const tags = BuildFootageTags(norm)
                 items.push({
                     URL: norm.hlsUrl,
@@ -2358,7 +2374,7 @@ function CollectPageDownloads() {
             if (!url || seen.has(url)) continue
             seen.add(url)
             const tags = BuildTags(AudioData, items.length + 1)
-            if (skipDl && tags && tags.id && IsDownloaded(tags.id)) continue
+            if (skipDl && tags && tags.id && IsDownloaded(tags.id)) { _lastCollectSkipped++; continue }
             items.push({
                 URL: url,
                 baseName: MakeFilename(AudioData, RowData.Pagetype),
@@ -2660,8 +2676,9 @@ function EnsureDownloadAllButton() {
             cursor: 'pointer',
             boxShadow: '0 4px 16px rgba(0,0,0,.4)'
         })
-        btn.addEventListener('click', async () => {
+        btn.addEventListener('click', async ev => {
             StartHelperOnClick() // before the first await, while the click still counts
+            const includeDownloaded = ev.shiftKey // read now: the event is gone after an await
             try {
                 btn.disabled = true
                 btn.style.opacity = '0.6'
@@ -2675,12 +2692,21 @@ function EnsureDownloadAllButton() {
                     await ScrollToBottom()
                 }
 
-                const items = CollectPageDownloads()
+                const items = CollectPageDownloads(includeDownloaded)
+                const skipped = _lastCollectSkipped
                 btn.disabled = false
                 btn.style.opacity = ''
                 if (!items.length) {
-                    Notify('No downloadable tracks found here', 'Artlist DL')
+                    Notify(
+                        skipped
+                            ? `All ${skipped} here are already downloaded. Shift-click Download all to download them again.`
+                            : 'No downloadable tracks found here',
+                        'Artlist DL'
+                    )
                     return
+                }
+                if (skipped) {
+                    Notify(`Skipping ${skipped} already downloaded (Shift-click Download all to include them)`, 'Artlist DL')
                 }
                 const cap = Clamp(GetSetting('downloadAllCap') || 25, 1, 100000)
                 if (
@@ -3209,8 +3235,6 @@ function adlBuildBody(body) {
     )
     ui.body.appendChild(adlToggle('Desktop notifications', 'notifications'))
     ui.body.appendChild(adlToggle('Mark already-downloaded (yellow)', 'markDownloaded'))
-    ui.body.appendChild(adlToggle('Ask before re-downloading (Shift skips)', 'confirmRedownload'))
-    ui.body.appendChild(adlToggle('Skip downloaded in "Download all"', 'skipDownloadedInBulk'))
     body.appendChild(ui.card)
 
     // ---- Local Sync card ----------------------------------------------------
@@ -5182,7 +5206,9 @@ function InstallFootageDelegation() {
             // The MAIN clip (matches the URL id) packs into footage/<Clip Name>/ —
             // the same folder its related SFX use. Strip clips go to the footage root.
             const fid = 'f.' + norm.clipId
-            if (!e.shiftKey && !ConfirmRedownload(fid, norm.clipName)) return
+            // Same folder DownloadFootageClip will pick, for the "open it" case.
+            const openCategory = GetPagetype() === FOOTAGE_CLIP_PAGETYPE ? FootagePackFolder() : GetCategory(norm, null)
+            if (OpenIfDownloaded(e.shiftKey, fid, 'footage', openCategory)) return
             await DownloadFootageClip(norm, null)
             for (const b of unsafeWindow.document.querySelectorAll('[data-artlist-dl-id="' + fid + '"]')) {
                 if (IsDownloaded(fid)) ApplyDownloadedStyle(b)
@@ -5325,7 +5351,7 @@ function WriteAudio(RowData, AudioData) {
                 return
             }
             StartHelperOnClick()
-            if (!event.shiftKey && !ConfirmRedownload(Tags && Tags.id, FileName)) {
+            if (OpenIfDownloaded(event.shiftKey, Tags && Tags.id, Kind, Category)) {
                 event.preventDefault()
                 return
             }
@@ -5375,7 +5401,7 @@ function WriteBanner(BannerData, AudioData) {
                 return
             }
             StartHelperOnClick()
-            if (!event.shiftKey && !ConfirmRedownload(Tags && Tags.id, FileName)) {
+            if (OpenIfDownloaded(event.shiftKey, Tags && Tags.id, Kind, Category)) {
                 event.preventDefault()
                 return
             }
