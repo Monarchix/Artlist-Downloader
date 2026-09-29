@@ -17,7 +17,7 @@
 // @connect     fonts.gstatic.com
 // @connect     127.0.0.1
 // @require     https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js
-// @version     1.1.4
+// @version     1.2.0
 // @run-at      document-start
 // @updateURL   https://github.com/Monarchix/artlist-downloader/raw/main/artlist-downloader.user.js
 // @downloadURL https://github.com/Monarchix/artlist-downloader/raw/main/artlist-downloader.user.js
@@ -80,7 +80,7 @@ var SingleSongData = 'none'
  * the page-type / data-type matching that the download mechanism depends on.
  * ========================================================================== */
 
-const ARTLIST_DL_VERSION = '1.1.4'
+const ARTLIST_DL_VERSION = '1.2.0'
 
 // ---- Settings -------------------------------------------------------------
 const SETTINGS_KEY = 'artlist-dl-settings'
@@ -88,6 +88,7 @@ const DEFAULT_SETTINGS = {
     filenamePattern: '{type} {artist} - {title} {album}({ids})',
     notifications: true,
     markDownloaded: true,
+    confirmRedownload: true, // ask before downloading something already in the history (Shift-click skips)
     autoDetectExtension: true,
     embedTags: false, // experimental: prepend ID3v2 tags (mp3/aac/flac/wav)
     embedCoverArt: false, // fetch and embed cover art into ID3 APIC frame
@@ -441,13 +442,183 @@ function MarkDownloaded(id, name, artist, album) {
     })
     _saveDownloaded()
 }
+// ---- Download log ----------------------------------------------------------
+// One row per save attempt: what, where, when, and whether it worked. Separate
+// from DownloadedIds above, which is only the "have I got this?" index. Failed
+// rows keep a `retry` payload so they can be re-run from the History card.
+// The block between the markers is pure (no DOM, no storage) and unit-tested by
+// tools/test-download-log.js -- keep it that way.
+// <download-log-core>
+const LOG_KEY = 'artlist-dl-log'
+const LOG_MAX = 500
+
+// Identity of an item across attempts. The file name is a last resort: a failed
+// row holds the bare base name while a saved one holds name + extension, so
+// artist/title is the better key when there is no id.
+function LogKey(e) {
+    const who = e.id || [e.artist, e.title].filter(Boolean).join(' - ') || e.file || ''
+    return (e.kind || '') + '|' + who
+}
+
+// Returns a new array; never mutates `log`. A fresh result for an item replaces
+// its earlier failure, so a retry that works leaves no stale "failed" row. Past
+// LOG_MAX the oldest *successful* rows go first: a failure with its retry payload
+// is the one thing the user can still act on, so it is never evicted.
+function LogAppend(log, entry, now) {
+    const ts = now || new Date().toISOString()
+    const { retry, ...rest } = entry
+    const stamped = entry.status === 'failed' ? { ...entry, ts } : { ...rest, ts }
+    const key = LogKey(stamped)
+    const next = [...log.filter(e => !(e.status === 'failed' && LogKey(e) === key)), stamped]
+    let excess = next.length - LOG_MAX
+    if (excess <= 0) return next
+    return next.filter(e => e.status === 'failed' || excess-- <= 0)
+}
+
+function LogFailed(log) {
+    return log.filter(e => e.status === 'failed')
+}
+
+// Newest successful save of an item, or null.
+function LogLatestOk(log, id) {
+    if (!id) return null
+    for (let i = log.length - 1; i >= 0; i--) {
+        if (log[i].status === 'ok' && log[i].id === id) return log[i]
+    }
+    return null
+}
+
+// Spreadsheets run a cell starting with = + - @ as a formula, and track titles
+// are page-supplied text, so neutralise those.
+function CsvCell(v) {
+    let s = String(v == null ? '' : v)
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s
+    return '"' + s.replace(/"/g, '""') + '"'
+}
+
+// `known` is the id -> {name, artist, album, ts} index; ids already present in
+// the log are skipped so nothing appears twice.
+function LogToCsv(log, known) {
+    const head = ['id', 'kind', 'title', 'artist', 'album', 'file', 'folder', 'status', 'error', 'date']
+    const rows = [head.map(CsvCell).join(',')]
+    const seen = new Set()
+    for (const e of log) {
+        if (e.id) seen.add(e.id)
+        rows.push(
+            [e.id, e.kind, e.title, e.artist, e.album, e.file, e.folder, e.status, e.error, e.ts]
+                .map(CsvCell)
+                .join(',')
+        )
+    }
+    for (const [id, m] of known || []) {
+        if (seen.has(id)) continue
+        const meta = m || {}
+        rows.push(
+            [id, '', meta.name, meta.artist, meta.album, '', '', 'known', '', meta.ts]
+                .map(CsvCell)
+                .join(',')
+        )
+    }
+    return rows.join('\n')
+}
+// </download-log-core>
+
+function LoadLog() {
+    try {
+        const raw = gmGet(LOG_KEY, null)
+        const parsed = raw ? JSON.parse(raw) : []
+        return Array.isArray(parsed) ? parsed : []
+    } catch (e) {
+        return []
+    }
+}
+let DownloadLog = LoadLog()
+
+function RecordDownload(entry) {
+    try {
+        // Re-read first: GM storage is shared by every open Artlist tab, and
+        // appending to this tab's stale copy would overwrite the other tab's rows.
+        DownloadLog = LogAppend(LoadLog(), entry)
+        gmSet(LOG_KEY, JSON.stringify(DownloadLog))
+    } catch (e) {
+        RecordError('RecordDownload', e)
+    }
+}
+
+// Fields every log row takes from a tags object (audio and footage share it).
+function EntryFromTags(tags, kind, file, folder) {
+    const t = tags || {}
+    return {
+        kind: kind || 'music',
+        id: t.id || '',
+        title: t.title || '',
+        artist: t.artist || '',
+        album: t.album || '',
+        file: file || '',
+        folder: folder || ''
+    }
+}
+
 const DownloadedButtonColor = '#ffd400' // yellow = already downloaded
+
+// Yellow tint plus a small check badge, so a downloaded track is recognisable at
+// a glance and not only by colour. The badge is a pseudo-element, so it needs no
+// extra DOM inside Artlist's buttons.
+const BADGE_STYLE_ID = 'artlist-dl-badge-style'
+function EnsureBadgeStyle() {
+    try {
+        if (document.getElementById(BADGE_STYLE_ID)) return
+        const host = document.head || document.documentElement
+        if (!host) return
+        const s = document.createElement('style')
+        s.id = BADGE_STYLE_ID
+        s.textContent =
+            '[data-artlist-dl-done]::after{content:"\\2713";position:absolute;top:-5px;right:-5px;' +
+            'width:15px;height:15px;border-radius:50%;background:' + DownloadedButtonColor + ';color:#111;' +
+            'font:700 10px/15px system-ui,sans-serif;text-align:center;pointer-events:none;' +
+            'box-shadow:0 0 0 2px #121212;z-index:2}'
+        host.appendChild(s)
+    } catch (e) {}
+}
+
+function DownloadedTitle(id) {
+    const hit = LogLatestOk(DownloadLog, id)
+    if (!hit) return 'Artlist DL: already downloaded (Shift-click to skip the prompt)'
+    const when = new Date(hit.ts).toLocaleDateString()
+    const where = [hit.folder, hit.file].filter(Boolean).join('/')
+    return 'Artlist DL: downloaded ' + when + (where ? ' - ' + where : '')
+}
+
 function ApplyDownloadedStyle(button) {
     if (!button) return
     button.style.color = DownloadedButtonColor
     button.style.borderColor = DownloadedButtonColor
     button.style.filter = ''
-    button.title = 'Artlist DL: already downloaded'
+    button.setAttribute('data-artlist-dl-done', '1')
+    // The badge is absolutely positioned against the button.
+    try {
+        if (unsafeWindow.getComputedStyle(button).position === 'static') {
+            button.style.position = 'relative'
+        }
+    } catch (e) {}
+    button.title = DownloadedTitle(button.getAttribute('data-artlist-dl-id'))
+    EnsureBadgeStyle()
+}
+
+// Clicking a track you already have asks first, since that is the click that
+// wastes a download. Shift-click, or the setting, turns the prompt off.
+function ConfirmRedownload(id, label) {
+    if (!id || !IsDownloaded(id) || !GetSetting('confirmRedownload')) return true
+    const hit = LogLatestOk(DownloadLog, id)
+    const when = hit ? ' on ' + new Date(hit.ts).toLocaleDateString() : ''
+    const yes = unsafeWindow.confirm(
+        'Artlist DL: "' + (label || id) + '" was already downloaded' + when +
+        '.\n\nDownload it again?\n(Hold Shift when clicking to skip this question.)'
+    )
+    // Chrome's "stop this page creating dialogs" makes confirm() answer no for
+    // good, which would otherwise look like a dead button.
+    if (!yes) Notify('Skipped: already downloaded (Shift-click to download again)', 'Artlist DL')
+    return yes
 }
 
 function BuildTags(d, trackNum) {
@@ -1282,6 +1453,24 @@ function RequestHelperStart() {
     }
 }
 
+// A download click is the other moment the page holds user activation, so use it
+// to bring the helper up *before* the save finishes and auto-open needs it. The
+// login entry and the watchdog normally have it running already, which makes this
+// a no-op; it only fires in the gap after a crash, and at most once a minute so a
+// dead helper can't turn every click into a prompt.
+//
+// MUST be called synchronously from a click handler, before any await.
+const HELPER_CLICK_LAUNCH_COOLDOWN_MS = 60000
+let _lastClickLaunch = 0
+function StartHelperOnClick() {
+    if (HelperAvailable) return
+    if (typeof GetSetting === 'function' && !GetSetting('autoOpenFolder')) return
+    const now = Date.now()
+    if (now - _lastClickLaunch < HELPER_CLICK_LAUNCH_COOLDOWN_MS) return
+    _lastClickLaunch = now
+    RequestHelperStart()
+}
+
 // Poll /ping until the helper answers or we run out of patience. pythonw's
 // first start on a cold cache is comfortably slower than a single check.
 async function WaitForHelper(maxMs) {
@@ -1947,6 +2136,8 @@ async function DownloadMany(items, zipName, kind) {
     const retryCount = Clamp(GetSetting('retryCount') || 0, 0, 5)
     const zip = folderMode ? null : new JSZip()
     const usedNames = new Set()
+    const zipOkRows = [] // log rows held back until the zip is really saved
+    let zipClosed = false
 
     const queue = new DownloadQueue(items, { concurrency, retryCount })
     const overlay = CreateProgressOverlay(queue)
@@ -1973,13 +2164,12 @@ async function DownloadMany(items, zipName, kind) {
                 tagged = await MaybeEmbedTags(blob, ext, item.tags)
             }
 
+            let savedName, savedFolder
             if (folderMode) {
                 const dir = await GetCategoryDir(rootHandle, item.category)
-                await WriteFileToDir(
-                    dir,
-                    SanitizeFilename(item.baseName || 'audio') + '.' + ext,
-                    tagged
-                )
+                savedName = SanitizeFilename(item.baseName || 'audio') + '.' + ext
+                savedFolder = (item.category || []).join('/')
+                await WriteFileToDir(dir, savedName, tagged)
             } else {
                 const prefix =
                     item.category && item.category.length
@@ -1991,9 +2181,48 @@ async function DownloadMany(items, zipName, kind) {
                 while (usedNames.has(name)) name = prefix + base + ' (' + n++ + ').' + ext
                 usedNames.add(name)
                 zip.file(name, tagged)
+                savedName = name
+                savedFolder = zipName
             }
             if (item.tags && item.tags.id) MarkDownloaded(item.tags.id, item.tags.title, item.tags.artist, item.tags.album)
+            const okRow = {
+                ...EntryFromTags(item.tags, item.hls ? 'footage' : kind, savedName, savedFolder),
+                status: 'ok'
+            }
+            if (folderMode) RecordDownload(okRow)
+            // Zip mode: a file only counts as saved once the zip is. And a retry
+            // that finishes after the zip has been written is not in it, so it must
+            // not clear that item's failed row either.
+            else if (!zipClosed) zipOkRows.push(okRow)
         })
+
+        // Items that ran out of retries. A later successful retry (the overlay's
+        // button, or the History card) replaces these rows.
+        for (const it of queue.items) {
+            if (it.status !== 'failed') continue
+            RecordDownload({
+                ...EntryFromTags(it.tags, it.hls ? 'footage' : kind, it.baseName, (it.category || []).join('/')),
+                status: 'failed',
+                error: it.error || 'download failed',
+                retry: it.hls
+                    ? {
+                          type: 'hls',
+                          url: it.URL,
+                          baseName: it.baseName,
+                          tags: it.tags,
+                          category: it.category,
+                          target: GetSetting('defaultFootageResolution') || '1080p'
+                      }
+                    : {
+                          type: 'audio',
+                          url: it.URL,
+                          baseName: it.baseName,
+                          tags: it.tags,
+                          category: it.category,
+                          kind
+                      }
+            })
+        }
 
         const c = queue.counts
         if (c.failed > 0) overlay.showRetryBtn()
@@ -2018,6 +2247,7 @@ async function DownloadMany(items, zipName, kind) {
         }
 
         overlay.update('Creating zip…')
+        zipClosed = true
         const zipBlob = await zip.generateAsync({ type: 'blob' }, meta =>
             overlay.update(`Zipping ${Math.round(meta.percent)}%`)
         )
@@ -2025,6 +2255,7 @@ async function DownloadMany(items, zipName, kind) {
             { description: 'ZIP File', accept: { 'application/zip': ['.zip'] } }
         ])
         if (saved) {
+            for (const row of zipOkRows) RecordDownload(row)
             overlay.done(`Saved ${c.done} files${c.failed ? ', ' + c.failed + ' failed' : ''}`)
             Notify(`Saved ${c.done} files as ${zipName}`, 'Artlist DL')
             ShowSavedToast(zipName, null, [])
@@ -2430,6 +2661,7 @@ function EnsureDownloadAllButton() {
             boxShadow: '0 4px 16px rgba(0,0,0,.4)'
         })
         btn.addEventListener('click', async () => {
+            StartHelperOnClick() // before the first await, while the click still counts
             try {
                 btn.disabled = true
                 btn.style.opacity = '0.6'
@@ -2602,6 +2834,17 @@ const ADL_CSS = `
 .adl-btn-accent { background:#f5d90a; border-color:#f5d90a; color:#161616; font-weight:600; }
 .adl-btn-accent:hover { background:#ffe53d; }
 .adl-btn-danger:hover { background:#3a1f1f; border-color:#5b2b2b; color:#ff8f8f; }
+
+.adl-log { display:flex; flex-direction:column; gap:6px; max-height:250px; overflow-y:auto; }
+.adl-log .adl-hint { margin:0; }
+.adl-log-row { display:flex; align-items:center; gap:8px; background:#161616; border:1px solid #242424; border-radius:9px; padding:7px 9px; min-width:0; }
+.adl-log-dot { flex:0 0 auto; width:16px; text-align:center; font-weight:700; color:#82ff59; }
+.adl-log-row.adl-failed { border-color:#4a2a2a; }
+.adl-log-row.adl-failed .adl-log-dot { color:#ff6b6b; }
+.adl-log-main { flex:1 1 auto; min-width:0; }
+.adl-log-title { font-size:12.5px; color:#e8e8e8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.adl-log-meta { font-size:10.5px; color:#7c7c7c; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.adl-log-row .adl-chip { flex:0 0 auto; }
 
 .adl-footer { flex:0 0 auto; padding:12px 20px; border-top:1px solid #242424; text-align:center; }
 .adl-link { color:#8c8c8c; font-size:12px; text-decoration:none; }
@@ -2828,14 +3071,9 @@ function adlFolderRow(kind) {
 
 // ---- History export helpers -----------------------------------------------
 function ExportHistoryCSV() {
-    const rows = [['id', 'title', 'artist', 'album', 'date']]
-    for (const [id, meta] of DownloadedIds) {
-        const m = meta || {}
-        const esc = v => '"' + String(v || '').replace(/"/g, '""') + '"'
-        rows.push([esc(id), esc(m.name), esc(m.artist), esc(m.album), esc(m.ts || '')])
-    }
-    const csv = rows.map(r => r.join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv' })
+    // BOM so Excel reads the UTF-8 titles (accents, dashes) correctly.
+    const csv = '﻿' + LogToCsv(DownloadLog, DownloadedIds)
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url; a.download = 'artlist-dl-history.csv'
@@ -2971,6 +3209,7 @@ function adlBuildBody(body) {
     )
     ui.body.appendChild(adlToggle('Desktop notifications', 'notifications'))
     ui.body.appendChild(adlToggle('Mark already-downloaded (yellow)', 'markDownloaded'))
+    ui.body.appendChild(adlToggle('Ask before re-downloading (Shift skips)', 'confirmRedownload'))
     ui.body.appendChild(adlToggle('Skip downloaded in "Download all"', 'skipDownloadedInBulk'))
     body.appendChild(ui.card)
 
@@ -3047,15 +3286,94 @@ function adlBuildBody(body) {
 
     // ---- History card -------------------------------------------------------
     const hist = adlSection('History')
-    const histCount = adlEl('p', {
-        class: 'adl-hint',
-        text: `${DownloadedIds.size} track${DownloadedIds.size !== 1 ? 's' : ''} in download history`
+    const histCount = adlEl('p', { class: 'adl-hint' })
+    const histList = adlEl('div', { class: 'adl-log' })
+    const retryAllBtn = adlEl('button', { class: 'adl-btn adl-btn-accent', text: 'Retry failed' })
+
+    const renderHistory = () => {
+        const failed = LogFailed(DownloadLog)
+        const n = DownloadedIds.size
+        histCount.textContent =
+            `${n} track${n !== 1 ? 's' : ''} in download history` +
+            (failed.length ? ` · ${failed.length} failed` : '')
+        retryAllBtn.style.display = failed.length ? '' : 'none'
+        retryAllBtn.textContent = `Retry ${failed.length} failed`
+
+        histList.textContent = ''
+        const recent = DownloadLog.slice(-15).reverse()
+        if (!recent.length) {
+            histList.appendChild(adlEl('p', { class: 'adl-hint', text: 'Nothing logged yet — downloads will show up here.' }))
+            return
+        }
+        for (const e of recent) {
+            const isFailed = e.status === 'failed'
+            const name = e.artist && e.title ? `${e.artist} – ${e.title}` : e.title || e.file || e.id
+            const when = new Date(e.ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+            const row = adlEl('div', { class: 'adl-log-row' + (isFailed ? ' adl-failed' : '') }, [
+                adlEl('span', { class: 'adl-log-dot', text: isFailed ? '✕' : '✓' }),
+                adlEl('div', { class: 'adl-log-main' }, [
+                    adlEl('div', { class: 'adl-log-title', text: name, title: name }),
+                    adlEl('div', {
+                        class: 'adl-log-meta',
+                        text: isFailed ? `${e.kind} · ${when} · ${e.error || 'failed'}` : `${e.kind} · ${when}`,
+                        title: [e.folder, e.file].filter(Boolean).join('/')
+                    })
+                ])
+            ])
+            if (isFailed && e.retry) {
+                const btn = adlEl('button', { class: 'adl-chip', text: 'Retry' })
+                btn.addEventListener('click', async () => {
+                    btn.disabled = true
+                    btn.textContent = '…'
+                    try { await RetryLogEntry(e) } catch (err) { RecordError('RetryLogEntry', err) }
+                    ReapplyDownloadedStyles()
+                    renderHistory()
+                })
+                row.appendChild(btn)
+            }
+            histList.appendChild(row)
+        }
+    }
+
+    // One at a time: parallel retries would race for the folder handle, and this
+    // way a run that fails on item 1 still tries item 2.
+    //
+    // Only rows whose output folder is set. Without one every retry ends in a
+    // save dialog, and Chrome only opens that within a few seconds of the click:
+    // the first item would work and the rest would fail with a gesture error.
+    // Those rows keep their own Retry button, where each click is its own gesture.
+    retryAllBtn.addEventListener('click', async () => {
+        const failed = LogFailed(DownloadLog).filter(e => e.retry)
+        const todo = failed.filter(e => GetOutputHandle(e.kind))
+        if (!todo.length) {
+            Notify('Set a download folder for these items to retry them together, or use each row\'s Retry button', 'Artlist DL')
+            return
+        }
+        retryAllBtn.disabled = true
+        for (const chip of histList.querySelectorAll('.adl-chip')) chip.disabled = true
+        let ok = 0
+        for (let i = 0; i < todo.length; i++) {
+            retryAllBtn.textContent = `Retrying ${i + 1}/${todo.length}…`
+            try { if (await RetryLogEntry(todo[i])) ok++ } catch (err) { RecordError('RetryLogEntry', err) }
+        }
+        retryAllBtn.disabled = false
+        ReapplyDownloadedStyles()
+        renderHistory()
+        const skipped = failed.length - todo.length
+        Notify(
+            `Retried ${todo.length}: ${ok} saved, ${todo.length - ok} still failing` +
+                (skipped ? `, ${skipped} skipped (no download folder set)` : ''),
+            'Artlist DL'
+        )
     })
+
     hist.body.appendChild(histCount)
+    hist.body.appendChild(histList)
+    hist.body.appendChild(adlEl('div', { class: 'adl-row adl-row-btns' }, [retryAllBtn]))
     hist.body.appendChild(
         adlEl('div', { class: 'adl-row adl-row-btns' }, [
             adlEl('button', {
-                class: 'adl-btn adl-btn-accent',
+                class: 'adl-btn',
                 text: 'Export CSV',
                 onClick: () => {
                     try { ExportHistoryCSV() }
@@ -3078,14 +3396,18 @@ function adlBuildBody(body) {
                 class: 'adl-btn adl-btn-danger',
                 text: 'Clear history',
                 onClick: () => {
+                    if (!unsafeWindow.confirm('Clear the whole download history and log?\n\nTracks will stop showing as downloaded until they are downloaded or scanned again.')) return
                     DownloadedIds.clear()
                     gmSet(DOWNLOADED_KEY, '[]')
-                    histCount.textContent = '0 tracks in download history'
+                    DownloadLog = []
+                    gmSet(LOG_KEY, '[]')
+                    renderHistory()
                     Notify('Cleared downloaded history', 'Artlist DL')
                 }
             })
         ])
     )
+    renderHistory()
     body.appendChild(hist.card)
 
     const dbg = adlSection('Debug')
@@ -3305,6 +3627,7 @@ try {
         downloaded() {
             return Object.fromEntries(DownloadedIds)
         },
+        log() { return DownloadLog },
         exportHistoryCSV() { ExportHistoryCSV() },
         exportHistoryM3U() { ExportHistoryM3U() },
         syncFolders() { return SyncAllOutputFolders() },
@@ -3562,10 +3885,12 @@ async function ShowSaveFilePickerForURL(url, baseFilename, tags, category, kind)
         const filename = SanitizeFilename(baseFilename) + '.' + ext
 
         let savedPath = null
+        let savedInFolder = false
         if (folderReady) {
             try {
                 const dir = await GetCategoryDir(rootHandle, category)
                 await WriteFileToDir(dir, filename, data)
+                savedInFolder = true
                 savedPath =
                     (category && category.length ? category.join('/') + '/' : '') +
                     filename
@@ -3585,6 +3910,10 @@ async function ShowSaveFilePickerForURL(url, baseFilename, tags, category, kind)
         }
 
         if (tags && tags.id) MarkDownloaded(tags.id, tags.title, tags.artist, tags.album)
+        RecordDownload({
+            ...EntryFromTags(tags, kind, filename, savedInFolder ? (category || []).join('/') : ''),
+            status: 'ok'
+        })
         Notify('Saved: ' + savedPath, 'Artlist DL')
         // "Open folder" toast
         const toastPath = folderReady && rootHandle
@@ -3593,6 +3922,12 @@ async function ShowSaveFilePickerForURL(url, baseFilename, tags, category, kind)
         ShowSavedToast(toastPath, folderReady ? rootHandle : null, category || [], kind)
     } catch (e) {
         RecordError('ShowSaveFilePickerForURL', e, { url, baseFilename })
+        RecordDownload({
+            ...EntryFromTags(tags, kind, baseFilename, (category || []).join('/')),
+            status: 'failed',
+            error: e && e.message ? e.message : String(e),
+            retry: { type: 'audio', url, baseName: baseFilename, tags, category, kind }
+        })
         Notify('Download failed — see console / ArtlistDL.errors', 'Artlist DL')
     }
 }
@@ -4449,6 +4784,10 @@ async function SaveFootageVideo(blob, baseName, tags, category) {
         savedPath = filename
     }
     if (tags && tags.id) MarkDownloaded(tags.id, tags.title, tags.artist, tags.album)
+    RecordDownload({
+        ...EntryFromTags(tags, 'footage', filename, (category || []).join('/')),
+        status: 'ok'
+    })
     // "Open folder" toast
     const _toastPath = rootHandle
         ? rootHandle.name + (category && category.length ? '/' + category.join('/') : '')
@@ -4505,10 +4844,50 @@ async function DownloadFootageClip(norm, forceTarget, categoryOverride) {
         return false
     } catch (e) {
         RecordError('DownloadFootageClip', e, { clip: norm.clipId })
+        const label = VariantLabel(chosen)
+        const baseName = MakeFootageFilename(norm, label)
+        RecordDownload({
+            ...EntryFromTags(Tags, 'footage', baseName, (Category || []).join('/')),
+            status: 'failed',
+            error: e && e.message ? e.message : String(e),
+            retry: { type: 'hls', url: norm.hlsUrl, baseName, tags: Tags, category: Category, target: label }
+        })
         overlay.fail('Footage download failed — see ArtlistDL.errors')
         Notify('Footage download failed', 'Artlist DL')
         return false
     }
+}
+
+// ---- Retrying failed log rows -------------------------------------------------
+// Both run from a click in the History card, so folder permission and the save
+// dialog still have the user activation they need. Success and failure are
+// recorded by the save paths themselves; this only reports which one happened.
+async function RetryHls(r) {
+    try {
+        const variants = await GetClipVariants(r.url)
+        const variant = PickHlsVariant(variants, r.target || GetSetting('defaultFootageResolution') || '1080p')
+        if (!variant) throw new Error('no HLS variant')
+        const blob = await DownloadHlsAsBlob(variant.url)
+        return !!(await SaveFootageVideo(blob, r.baseName, r.tags, r.category))
+    } catch (e) {
+        RecordError('RetryHls', e, { url: r.url })
+        RecordDownload({
+            ...EntryFromTags(r.tags, 'footage', r.baseName, (r.category || []).join('/')),
+            status: 'failed',
+            error: e && e.message ? e.message : String(e),
+            retry: r
+        })
+        return false
+    }
+}
+
+// Resolves true when the item is no longer in the failed list afterwards.
+async function RetryLogEntry(entry) {
+    const r = entry && entry.retry
+    if (!r) return false
+    if (r.type === 'hls') return RetryHls(r)
+    await ShowSaveFilePickerForURL(r.url, r.baseName, r.tags, r.category, r.kind)
+    return !LogFailed(DownloadLog).some(e => LogKey(e) === LogKey(entry))
 }
 
 // Resolution picker modal (Shadow DOM) — lists HLS variants. Resolves a variant or null.
@@ -4790,6 +5169,7 @@ function InstallFootageDelegation() {
 
             e.stopImmediatePropagation()
             e.preventDefault()
+            StartHelperOnClick()
             const norm = ResolveFootageClip(btn, clipId)
             if (!norm) {
                 Notify('Hover the clip to load its preview, then click download', 'Artlist DL')
@@ -4802,6 +5182,7 @@ function InstallFootageDelegation() {
             // The MAIN clip (matches the URL id) packs into footage/<Clip Name>/ —
             // the same folder its related SFX use. Strip clips go to the footage root.
             const fid = 'f.' + norm.clipId
+            if (!e.shiftKey && !ConfirmRedownload(fid, norm.clipName)) return
             await DownloadFootageClip(norm, null)
             for (const b of unsafeWindow.document.querySelectorAll('[data-artlist-dl-id="' + fid + '"]')) {
                 if (IsDownloaded(fid)) ApplyDownloadedStyle(b)
@@ -4943,6 +5324,11 @@ function WriteAudio(RowData, AudioData) {
                 Notify('Copied download URL to clipboard', 'Artlist DL')
                 return
             }
+            StartHelperOnClick()
+            if (!event.shiftKey && !ConfirmRedownload(Tags && Tags.id, FileName)) {
+                event.preventDefault()
+                return
+            }
             ShowSaveFilePickerForURL(Url, FileName, Tags, Category, Kind).then(
                 () => {
                     if (IsDownloaded(Tags && Tags.id))
@@ -4986,6 +5372,11 @@ function WriteBanner(BannerData, AudioData) {
                 event.preventDefault()
                 CopyToClipboard(Url)
                 Notify('Copied download URL to clipboard', 'Artlist DL')
+                return
+            }
+            StartHelperOnClick()
+            if (!event.shiftKey && !ConfirmRedownload(Tags && Tags.id, FileName)) {
+                event.preventDefault()
                 return
             }
             ShowSaveFilePickerForURL(Url, FileName, Tags, Category, Kind).then(
