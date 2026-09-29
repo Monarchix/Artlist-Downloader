@@ -49,6 +49,11 @@ echo [3/5] Added to Windows Startup: %SHIM%
 :: the drive heals itself within a minute.
 schtasks /create /tn "%TASK%" /tr "wscript.exe \"%WATCHDOG%\"" /sc minute /mo 1 /f >nul 2>&1
 if errorlevel 1 goto :taskfail
+:: schtasks cannot set these, and its defaults would stop the watchdog on battery
+:: power (a laptop) and skip a run missed while the PC slept. Non-fatal: the task
+:: still works without them, so a failure here only earns a warning.
+powershell -NoProfile -Command "Set-ScheduledTask -TaskName '%TASK%' -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)) | Out-Null" >nul 2>&1
+if errorlevel 1 echo        ^(warning: could not relax the task's battery settings -- fine on a desktop^)
 echo [4/5] Registered watchdog task "%TASK%" ^(checks every minute^)
 
 :: ---- 5. Start it now and prove it answers -----------------------------------
