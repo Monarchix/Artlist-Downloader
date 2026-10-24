@@ -19,6 +19,11 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 PORT = 7842
 
+# The userscript sends this header on /open. A web page cannot put a custom
+# header on a request to another origin without a CORS preflight, and this
+# server never grants one, so no website can open folders through the helper.
+OPEN_HEADER = 'X-Artlist-DL'
+
 _tab_count = 0
 _tab_lock  = threading.Lock()
 
@@ -124,6 +129,22 @@ def _force_foreground(hwnd):
             u.AttachThreadInput(this_thread, fg_thread, False)
 
 
+def is_local_abs_path(p):
+    """True for an absolute path on a local drive (C:\\..., or /... off Windows).
+
+    UNC and device paths (\\\\host\\share, //host/share, \\\\?\\...) are refused:
+    merely checking whether one exists makes Windows connect to that host and
+    offer it the user's login hash.
+    """
+    if not isinstance(p, str) or not p or '\0' in p:
+        return False
+    if p.startswith(('\\\\', '//', '/\\', '\\/')):
+        return False
+    if sys.platform == 'win32':
+        return len(p) >= 3 and p[0].isalpha() and p[1] == ':' and p[2] in '\\/'
+    return p.startswith('/')
+
+
 def open_folder(folder):
     """Show `folder` in the OS file manager, in front of whatever is on screen.
 
@@ -199,11 +220,14 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, b'OK')
 
         elif path == '/open':
+            if not self._from_userscript():
+                self._respond(403, b'Forbidden'); return
             folder = unquote(qs.get('path', [''])[0])
             if not folder:
                 self._respond(400, b'No path'); return
-            if not os.path.isdir(folder):
-                self._respond(404, ('Folder not found: ' + folder).encode())
+            # Local drives only, and the path is not echoed back.
+            if not is_local_abs_path(folder) or not os.path.isdir(folder):
+                self._respond(404, b'Folder not found')
                 return
             try:
                 open_folder(folder)
@@ -214,11 +238,22 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._respond(404, b'Not found')
 
+    def _from_userscript(self):
+        """True only for the userscript's own request.
+
+        The Host check stops DNS rebinding (a hostile site re-pointing its own
+        name at 127.0.0.1); the custom header stops every other web page.
+        """
+        host = (self.headers.get('Host') or '').lower()
+        if host not in ('127.0.0.1:%d' % PORT, 'localhost:%d' % PORT):
+            return False
+        return self.headers.get(OPEN_HEADER) == '1'
+
     def _respond(self, code, body):
         self.send_response(code)
-        self.send_header('Access-Control-Allow-Origin',  '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Private-Network', 'true')
+        # No CORS headers: the script reaches the helper through Tampermonkey's
+        # own request channel, not the page, so nothing legitimate needs them.
+        # Without them a web page cannot read what the helper answers.
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)

@@ -44,12 +44,13 @@ Function FindPythonw()
     '    open a console window, so it is worth hunting for before falling back to
     '    a launcher shim. Covers both the classic Programs\Python\Python3xx
     '    layout and the newer Python Manager one (LOCALAPPDATA\Python\
-    '    pythoncore-3.xx-64, plus its \bin shim folder).
+    '    pythoncore-3.xx-64, plus its \bin shim folder). C:\ itself is not
+    '    searched: any account can create a folder there, so a pythonw.exe
+    '    planted in one would be run at every login.
     roots = Array( _
         env("LOCALAPPDATA") & "\Programs\Python", _
         env("LOCALAPPDATA") & "\Python", _
-        env("ProgramFiles") & "\Python", _
-        "C:\")
+        env("ProgramFiles") & "\Python")
     For Each r In roots
         hit = ScanForPythonw(r)
         If hit <> "" Then

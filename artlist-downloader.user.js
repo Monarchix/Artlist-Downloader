@@ -17,7 +17,7 @@
 // @connect     fonts.gstatic.com
 // @connect     127.0.0.1
 // @require     https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js
-// @version     1.3.0
+// @version     1.3.1
 // @run-at      document-start
 // @updateURL   https://github.com/Monarchix/artlist-downloader/raw/main/artlist-downloader.user.js
 // @downloadURL https://github.com/Monarchix/artlist-downloader/raw/main/artlist-downloader.user.js
@@ -80,7 +80,7 @@ var SingleSongData = 'none'
  * the page-type / data-type matching that the download mechanism depends on.
  * ========================================================================== */
 
-const ARTLIST_DL_VERSION = '1.3.0'
+const ARTLIST_DL_VERSION = '1.3.1'
 
 // ---- Settings -------------------------------------------------------------
 const SETTINGS_KEY = 'artlist-dl-settings'
@@ -1382,6 +1382,9 @@ function OpenFolderViaHelper(kind, categorySegments) {
         GM_xmlhttpRequest({
             method: 'GET',
             url: HELPER_ORIGIN + '/open?path=' + encodeURIComponent(fullPath),
+            // The helper refuses /open without it, which is what keeps other
+            // websites from driving it (see OPEN_HEADER in artlist_helper.py).
+            headers: { 'X-Artlist-DL': '1' },
             // Generous: when no window exists yet the helper spawns Explorer and
             // waits up to 3 s to find and raise the window it made. Timing out
             // early here would report a failure for a folder that did open, and
@@ -3070,7 +3073,7 @@ function adlFolderRow(kind) {
         style: { fontSize: '11px', marginTop: '6px' }
     })
     pathInput.value = GetSetting(pathKey) || ''
-    pathInput.placeholder = 'Paste full path for quick-open  e.g. C:\\Users\\Amir\\Music'
+    pathInput.placeholder = 'Paste full path for quick-open  e.g. C:\\Users\\You\\Music'
     pathInput.addEventListener('change', () => SetSetting(pathKey, pathInput.value.trim()))
     pathInput.addEventListener('blur',   () => SetSetting(pathKey, pathInput.value.trim()))
 
